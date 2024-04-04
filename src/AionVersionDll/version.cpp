@@ -2,21 +2,21 @@
 #define _HAS_EXCEPTIONS 0
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
-
+#define _ENABLE_DEBUG 0
 #include <windows.h>
 #include <stdio.h>
 #include <string>
 #include <intrin.h>
 #include <winsock2.h>
 #include "detours.h"
+#include <ws2ipdef.h>
+#include <ws2tcpip.h>
 
-static const char s_ipToReplace[16] = "70.5.0.18";
+static const char s_ipToReplace[16] = "109.105.134.1";
 static char s_serverIp[16] = "";
 static bool s_needPatch = false;
 static bool s_gfxEnabled = false;
-bool g_didStartup = false;
-bool g_disableIpFix = false;
-
+//bool g_didStartup = false;
 bool g_isCursorHidden = false;
 bool g_windowedMousefixOnly = false;
 
@@ -27,9 +27,9 @@ bool g_stepGetCursorPos = 0;
 int g_stepPanning = 0;
 
 WNDPROC g_realWndProc;
+static bool needPatch = false;
 
-
-#if 0
+#if _ENABLE_DEBUG
 CRITICAL_SECTION cs;
 static FILE* s_logFile = nullptr;
 
@@ -73,19 +73,80 @@ bool GetServerIpFromCommandLine(char* buf, size_t bufsize) {
 static decltype(inet_addr) *real_inet_addr = inet_addr;
 unsigned long PASCAL FAR zzinet_addr(_In_z_ const char FAR * cp)
 {
-    if (!g_didStartup) {
-        void OnStartup();
-        OnStartup();
-        g_didStartup = true;
-    }
+    //if (!g_didStartup) {
+    //    void OnStartup();
+    //    OnStartup();
+    //    g_didStartup = true;
+    //}
 
-    if (!g_disableIpFix) {
-        s_needPatch = true;
-        if (!strcmp(cp, s_ipToReplace)) {
+    //if (!g_disableIpFix) {
+        //s_needPatch = true;
+        if (strcmp(cp, s_ipToReplace) == 0) {
+#if _ENABLE_DEBUG
+
+            log("restore %s to %s ", cp, s_serverIp);
+#endif
             return real_inet_addr(s_serverIp);
         }
-    }
+    //}
     return real_inet_addr(cp);
+}
+
+static decltype(inet_ntoa)* real_inet_ntoa = inet_ntoa;
+char FAR* 
+PASCAL
+zzinet_ntoa(_In_ struct in_addr in)
+{
+    static char tmp[16] = "";
+    snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", in.S_un.S_un_b.s_b1, in.S_un.S_un_b.s_b2, in.S_un.S_un_b.s_b3, in.S_un.S_un_b.s_b4);
+    if (needPatch && strcmp(tmp,s_serverIp) == 0)
+    {
+#if _ENABLE_DEBUG
+        log("change %s to %s", tmp, s_ipToReplace);
+#endif
+        needPatch = false;
+        return (char*)s_ipToReplace;
+    }
+    return real_inet_ntoa(in);
+}
+
+static decltype(connect)* real_connect = connect;
+int
+PASCAL
+zzconnect(
+    _In_ SOCKET s,
+    _In_reads_bytes_(namelen) const struct sockaddr FAR* name,
+    _In_ int namelen
+)
+{
+
+    struct sockaddr_in* sa_in = (struct sockaddr_in*)name;
+    char ipstr[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &(sa_in->sin_addr), ipstr, INET_ADDRSTRLEN)) {
+#if _ENABLE_DEBUG
+        log("zzconnect IPv4: %s, Port: %d\n", ipstr, ntohs(sa_in->sin_port));
+#endif
+    }
+
+    return real_connect(s, name, namelen);
+}
+
+
+static decltype(gethostbyname)* real_gethostbyname = gethostbyname;
+struct hostent FAR*
+PASCAL
+zzgethostbyname(_In_z_ const char FAR* name)
+{
+    
+    if (strcmp(name, s_serverIp) == 0)
+    {
+#if _ENABLE_DEBUG
+        log("change %s to %s", name, s_ipToReplace);
+#endif
+        needPatch = true;
+    }
+
+    return real_gethostbyname(name);
 }
 
 static decltype(lstrcpynA) *real_lstrcpynA = lstrcpynA;
@@ -98,9 +159,10 @@ zzlstrcpynA(
 ) {
     if (s_needPatch) {
         if (!strcmp(lpString2, s_serverIp)) {
-            s_needPatch = false;
+            //s_needPatch = false;
             return real_lstrcpynA(lpString1, s_ipToReplace, iMaxLength);
         }
+        
     }
     return real_lstrcpynA(lpString1, lpString2, iMaxLength);
 }
@@ -113,7 +175,7 @@ char*  __cdecl zzstrtok_s(
 ) {
     if (s_needPatch && _String && !strcmp(_String, s_serverIp)) {
         strcpy(_String, s_ipToReplace);
-        s_needPatch = false;
+        //s_needPatch = false;
     }
     return strtok_s(_String, _Delimiter, _Context);
 }
@@ -588,23 +650,30 @@ void InstallPatch()
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
-    g_disableIpFix = strstr(GetCommandLineA(), "-disable-ip-fix");
+    //g_disableIpFix = strstr(GetCommandLineA(), "-disable-ip-fix");
+    GetServerIpFromCommandLine(s_serverIp, sizeof(s_serverIp));
+    DetourAttach(&(PVOID&)real_inet_ntoa, zzinet_ntoa);
     DetourAttach(&(PVOID&)real_inet_addr, zzinet_addr);
+    //DetourAttach(&(PVOID&)real_connect, zzconnect);
+    //DetourAttach(&(PVOID&)real_wconnect, ZZWSAConnect);
+    DetourAttach(&(PVOID&)real_gethostbyname, zzgethostbyname);
 
-    if (!g_disableIpFix) {
-        if (GetServerIpFromCommandLine(s_serverIp, sizeof(s_serverIp))) {
+
+    
+    //if (!g_disableIpFix) {
+        //if (GetServerIpFromCommandLine(s_serverIp, sizeof(s_serverIp))) {
             // 4.x and earlier
-            DetourAttach(&(PVOID&)real_lstrcpynA, zzlstrcpynA);
+            //DetourAttach(&(PVOID&)real_lstrcpynA, zzlstrcpynA);
 
             // 5.x
-            HMODULE hmoduleMsvcr120 = GetModuleHandleA("msvcr120");
-            if (hmoduleMsvcr120) {
-                s_needPatch = true;
-                *(void**)&real_strtok_s = GetProcAddress(hmoduleMsvcr120, "strtok_s");
-                DetourAttach(&(PVOID&)real_strtok_s, zzstrtok_s);
-            }
-        }
-    }
+            //HMODULE hmoduleMsvcr120 = GetModuleHandleA("msvcr120");
+            //if (hmoduleMsvcr120) {
+            //    s_needPatch = true;
+            //    *(void**)&real_strtok_s = GetProcAddress(hmoduleMsvcr120, "strtok_s");
+            //    DetourAttach(&(PVOID&)real_strtok_s, zzstrtok_s);
+            //}
+        //}
+    //}
 
     bool installMouseFix = false;
     if (strstr(GetCommandLineA(), "-win10-mouse-fix-autodetect") > 0) {
